@@ -28,6 +28,7 @@ import {
   Copy,
   Download,
   ArrowDown,
+  FolderOpen,
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 
@@ -341,6 +342,41 @@ function RichEditor({
 
 // ─── File Upload Zone ──────────────────────────────────────────────────────────
 
+// Recursive helper: reads all files from a dropped directory entry
+function readAllEntries(entry: FileSystemEntry): Promise<File[]> {
+  return new Promise((resolve) => {
+    if (entry.isFile) {
+      (entry as FileSystemFileEntry).file((f) => {
+        // Preserve the full relative path from the entry
+        Object.defineProperty(f, "webkitRelativePath", {
+          value: entry.fullPath.replace(/^\//, ""),
+          writable: false,
+        });
+        resolve([f]);
+      }, () => resolve([]));
+    } else if (entry.isDirectory) {
+      const reader = (entry as FileSystemDirectoryEntry).createReader();
+      const allEntries: FileSystemEntry[] = [];
+      const readBatch = () => {
+        reader.readEntries((entries) => {
+          if (entries.length === 0) {
+            // All entries read, recurse into each
+            Promise.all(allEntries.map(readAllEntries)).then((results) =>
+              resolve(results.flat())
+            );
+          } else {
+            allEntries.push(...entries);
+            readBatch(); // Keep reading (readEntries may batch results)
+          }
+        }, () => resolve([]));
+      };
+      readBatch();
+    } else {
+      resolve([]);
+    }
+  });
+}
+
 function UploadZone({
   onFilesSelected,
   uploadingFiles,
@@ -350,11 +386,29 @@ function UploadZone({
 }) {
   const [dragging, setDragging] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
 
   const handleDrop = useCallback(
-    (e: React.DragEvent) => {
+    async (e: React.DragEvent) => {
       e.preventDefault();
       setDragging(false);
+
+      // Try to use DataTransferItem API for folder support
+      const items = e.dataTransfer.items;
+      if (items && items.length > 0) {
+        const entries: FileSystemEntry[] = [];
+        for (let i = 0; i < items.length; i++) {
+          const entry = items[i].webkitGetAsEntry?.();
+          if (entry) entries.push(entry);
+        }
+        if (entries.length > 0) {
+          const allFiles = (await Promise.all(entries.map(readAllEntries))).flat();
+          if (allFiles.length) onFilesSelected(allFiles);
+          return;
+        }
+      }
+
+      // Fallback: plain file drop
       const files = Array.from(e.dataTransfer.files);
       if (files.length) onFilesSelected(files);
     },
@@ -367,6 +421,12 @@ function UploadZone({
   };
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
+    if (files.length) onFilesSelected(files);
+    e.target.value = "";
+  };
+
+  const handleFolderChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files ?? []);
     if (files.length) onFilesSelected(files);
     e.target.value = "";
@@ -401,25 +461,43 @@ function UploadZone({
         </div>
         <div>
           <p className="text-sm font-semibold text-foreground mb-1">
-            Dosyaları buraya sürükleyip bırakın
+            Dosya veya klasörleri buraya sürükleyip bırakın
           </p>
           <p className="text-xs text-muted-foreground">
             PDF, Word, Excel, PowerPoint, görseller, video, ses, ZIP ve daha
             fazlası
           </p>
         </div>
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            inputRef.current?.click();
-          }}
-          className="px-6 py-2.5 rounded-xl text-sm font-semibold bg-primary text-primary-foreground hover:bg-blue-700 active:bg-blue-800 transition-colors shadow-sm"
-        >
-          Dosya Seç
-        </button>
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              inputRef.current?.click();
+            }}
+            className="px-6 py-2.5 rounded-xl text-sm font-semibold bg-primary text-primary-foreground hover:bg-blue-700 active:bg-blue-800 transition-colors shadow-sm"
+          >
+            <span className="flex items-center gap-2">
+              <Upload size={15} />
+              Dosya Seç
+            </span>
+          </button>
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              folderInputRef.current?.click();
+            }}
+            className="px-6 py-2.5 rounded-xl text-sm font-semibold bg-amber-500 text-white hover:bg-amber-600 active:bg-amber-700 transition-colors shadow-sm"
+          >
+            <span className="flex items-center gap-2">
+              <FolderOpen size={15} />
+              Klasör Seç
+            </span>
+          </button>
+        </div>
         <p className="text-xs text-muted-foreground">
-          veya dosyaları yukarıya sürükleyin · Çoklu seçim desteklenir
+          veya dosya / klasörleri yukarıya sürükleyin · Çoklu seçim desteklenir
         </p>
         <input
           ref={inputRef}
@@ -427,6 +505,14 @@ function UploadZone({
           multiple
           className="hidden"
           onChange={handleChange}
+        />
+        {/* @ts-ignore — webkitdirectory is not in React's type defs */}
+        <input
+          ref={folderInputRef}
+          type="file"
+          className="hidden"
+          onChange={handleFolderChange}
+          {...({ webkitdirectory: "true", directory: "" } as any)}
         />
       </motion.div>
 
@@ -837,14 +923,27 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
   const handleFilesSelected = async (files: File[]) => {
     const token = localStorage.getItem("token");
     const formData = new FormData();
-    files.forEach(f => formData.append("files", f));
     
-    const newUploads = files.map(f => ({
-      id: Math.random().toString(),
-      name: f.name,
-      size: formatBytes(f.size),
-      progress: 50,
-    }));
+    // For folder uploads, use webkitRelativePath as filename to preserve folder structure
+    files.forEach(f => {
+      const relativePath = (f as any).webkitRelativePath;
+      if (relativePath) {
+        // Send with the relative path so the backend stores the full path as original_name
+        formData.append("files", f, relativePath);
+      } else {
+        formData.append("files", f);
+      }
+    });
+    
+    const newUploads = files.map(f => {
+      const relativePath = (f as any).webkitRelativePath;
+      return {
+        id: Math.random().toString(),
+        name: relativePath || f.name,
+        size: formatBytes(f.size),
+        progress: 50,
+      };
+    });
     setUploadingFiles(prev => [...prev, ...newUploads]);
     
     try {
@@ -1014,7 +1113,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
                 Dosya Yükleme
               </h2>
               <p className="text-xs text-muted-foreground mt-0.5">
-                Her türlü dosya formatı desteklenir · Çoklu yükleme
+                Her türlü dosya formatı desteklenir · Çoklu yükleme · Klasör yükleme
               </p>
             </div>
             <div className="p-6">

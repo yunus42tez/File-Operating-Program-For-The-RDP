@@ -31,6 +31,7 @@ import {
   FolderOpen,
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
+import JSZip from "jszip";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -348,7 +349,7 @@ function readAllEntries(entry: FileSystemEntry): Promise<File[]> {
     if (entry.isFile) {
       (entry as FileSystemFileEntry).file((f) => {
         // Preserve the full relative path from the entry
-        Object.defineProperty(f, "webkitRelativePath", {
+        Object.defineProperty(f, "_relativePath", {
           value: entry.fullPath.replace(/^\//, ""),
           writable: false,
         });
@@ -360,13 +361,12 @@ function readAllEntries(entry: FileSystemEntry): Promise<File[]> {
       const readBatch = () => {
         reader.readEntries((entries) => {
           if (entries.length === 0) {
-            // All entries read, recurse into each
             Promise.all(allEntries.map(readAllEntries)).then((results) =>
               resolve(results.flat())
             );
           } else {
             allEntries.push(...entries);
-            readBatch(); // Keep reading (readEntries may batch results)
+            readBatch();
           }
         }, () => resolve([]));
       };
@@ -377,14 +377,34 @@ function readAllEntries(entry: FileSystemEntry): Promise<File[]> {
   });
 }
 
+// Zip a list of files into a single ZIP blob, preserving relative paths
+async function zipFiles(files: File[], folderName: string): Promise<File> {
+  const zip = new JSZip();
+  const folder = zip.folder(folderName)!;
+  for (const f of files) {
+    const relativePath = (f as any)._relativePath || (f as any).webkitRelativePath || f.name;
+    // Remove the root folder name from path if it matches, to avoid double nesting
+    const cleanPath = relativePath.startsWith(folderName + "/")
+      ? relativePath.slice(folderName.length + 1)
+      : relativePath;
+    const buf = await f.arrayBuffer();
+    folder.file(cleanPath, buf);
+  }
+  const blob = await zip.generateAsync({ type: "blob" });
+  return new window.File([blob], `${folderName}.zip`, { type: "application/zip" });
+}
+
 function UploadZone({
   onFilesSelected,
+  onFolderSelected,
   uploadingFiles,
 }: {
   onFilesSelected: (files: File[]) => void;
+  onFolderSelected: (zipFile: File, folderName: string) => void;
   uploadingFiles: UploadingFile[];
 }) {
   const [dragging, setDragging] = useState(false);
+  const [zipping, setZipping] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
 
@@ -393,26 +413,51 @@ function UploadZone({
       e.preventDefault();
       setDragging(false);
 
-      // Try to use DataTransferItem API for folder support
-      const items = e.dataTransfer.items;
-      if (items && items.length > 0) {
-        const entries: FileSystemEntry[] = [];
-        for (let i = 0; i < items.length; i++) {
-          const entry = items[i].webkitGetAsEntry?.();
-          if (entry) entries.push(entry);
+      const dtItems = e.dataTransfer.items;
+      if (dtItems && dtItems.length > 0) {
+        // Separate folders and files
+        const folderEntries: FileSystemEntry[] = [];
+        const fileEntries: FileSystemEntry[] = [];
+        for (let i = 0; i < dtItems.length; i++) {
+          const entry = dtItems[i].webkitGetAsEntry?.();
+          if (entry) {
+            if (entry.isDirectory) folderEntries.push(entry);
+            else fileEntries.push(entry);
+          }
         }
-        if (entries.length > 0) {
-          const allFiles = (await Promise.all(entries.map(readAllEntries))).flat();
-          if (allFiles.length) onFilesSelected(allFiles);
-          return;
+
+        // Process each dropped folder as a separate ZIP
+        for (const folderEntry of folderEntries) {
+          const folderName = folderEntry.name;
+          setZipping(true);
+          try {
+            const allFiles = await readAllEntries(folderEntry);
+            if (allFiles.length > 0) {
+              const zipFile = await zipFiles(allFiles, folderName);
+              onFolderSelected(zipFile, folderName);
+            }
+          } finally {
+            setZipping(false);
+          }
         }
+
+        // Process regular files normally
+        if (fileEntries.length > 0) {
+          const regularFiles = await Promise.all(
+            fileEntries.map(readAllEntries)
+          );
+          const flatFiles = regularFiles.flat();
+          if (flatFiles.length) onFilesSelected(flatFiles);
+        }
+
+        if (folderEntries.length > 0 || fileEntries.length > 0) return;
       }
 
       // Fallback: plain file drop
       const files = Array.from(e.dataTransfer.files);
       if (files.length) onFilesSelected(files);
     },
-    [onFilesSelected]
+    [onFilesSelected, onFolderSelected]
   );
 
   const handleDragOver = (e: React.DragEvent) => {
@@ -426,9 +471,19 @@ function UploadZone({
     e.target.value = "";
   };
 
-  const handleFolderChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFolderChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files ?? []);
-    if (files.length) onFilesSelected(files);
+    if (!files.length) return;
+    // Determine folder name from the first file's webkitRelativePath
+    const firstPath = files[0].webkitRelativePath || files[0].name;
+    const folderName = firstPath.split("/")[0] || "klasor";
+    setZipping(true);
+    try {
+      const zipFile = await zipFiles(files, folderName);
+      onFolderSelected(zipFile, folderName);
+    } finally {
+      setZipping(false);
+    }
     e.target.value = "";
   };
 
@@ -515,6 +570,25 @@ function UploadZone({
           {...({ webkitdirectory: "true", directory: "" } as any)}
         />
       </motion.div>
+
+      {/* Zipping indicator */}
+      <AnimatePresence>
+        {zipping && (
+          <motion.div
+            initial={{ opacity: 0, y: -8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -8 }}
+            className="bg-amber-50 border border-amber-200 rounded-xl px-5 py-3.5 flex items-center gap-3"
+          >
+            <div className="w-8 h-8 rounded-lg bg-amber-100 flex items-center justify-center flex-shrink-0">
+              <FolderOpen size={15} className="text-amber-600" />
+            </div>
+            <span className="text-sm font-medium text-amber-700">
+              Klasör ZIP olarak paketleniyor...
+            </span>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Upload progress */}
       <AnimatePresence>
@@ -920,30 +994,18 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
     }
   };
 
+  // Upload regular files (non-folder)
   const handleFilesSelected = async (files: File[]) => {
     const token = localStorage.getItem("token");
     const formData = new FormData();
+    files.forEach(f => formData.append("files", f));
     
-    // For folder uploads, use webkitRelativePath as filename to preserve folder structure
-    files.forEach(f => {
-      const relativePath = (f as any).webkitRelativePath;
-      if (relativePath) {
-        // Send with the relative path so the backend stores the full path as original_name
-        formData.append("files", f, relativePath);
-      } else {
-        formData.append("files", f);
-      }
-    });
-    
-    const newUploads = files.map(f => {
-      const relativePath = (f as any).webkitRelativePath;
-      return {
-        id: Math.random().toString(),
-        name: relativePath || f.name,
-        size: formatBytes(f.size),
-        progress: 50,
-      };
-    });
+    const newUploads = files.map(f => ({
+      id: Math.random().toString(),
+      name: f.name,
+      size: formatBytes(f.size),
+      progress: 50,
+    }));
     setUploadingFiles(prev => [...prev, ...newUploads]);
     
     try {
@@ -963,6 +1025,41 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
       showToast("Dosya yükleme hatası.", "error");
     } finally {
       setUploadingFiles(prev => prev.filter(u => !newUploads.find(n => n.id === u.id)));
+    }
+  };
+
+  // Upload folder as a single ZIP file
+  const handleFolderSelected = async (zipFile: File, folderName: string) => {
+    const token = localStorage.getItem("token");
+    const formData = new FormData();
+    formData.append("files", zipFile, `${folderName}.zip`);
+    
+    const uploadId = Math.random().toString();
+    const newUpload: UploadingFile = {
+      id: uploadId,
+      name: `📁 ${folderName}.zip`,
+      size: formatBytes(zipFile.size),
+      progress: 50,
+    };
+    setUploadingFiles(prev => [...prev, newUpload]);
+    
+    try {
+      const response = await fetch("/api/files", {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${token}` },
+        body: formData
+      });
+      
+      if (response.ok) {
+        showToast(`"${folderName}" klasörü başarıyla yüklendi.`);
+        fetchItems();
+      } else {
+        showToast("Klasör yükleme başarısız.", "error");
+      }
+    } catch (e) {
+      showToast("Klasör yükleme hatası.", "error");
+    } finally {
+      setUploadingFiles(prev => prev.filter(u => u.id !== uploadId));
     }
   };
 
@@ -1119,6 +1216,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
             <div className="p-6">
               <UploadZone
                 onFilesSelected={handleFilesSelected}
+                onFolderSelected={handleFolderSelected}
                 uploadingFiles={uploadingFiles}
               />
             </div>
